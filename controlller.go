@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -14,7 +13,6 @@ import (
 
 	"k8s.io/apimachinery/pkg/util/wait"
 	appinformers "k8s.io/client-go/informers/apps/v1"
-
 	"k8s.io/client-go/kubernetes"
 	applisters "k8s.io/client-go/listers/apps/v1"
 	"k8s.io/client-go/tools/cache"
@@ -71,13 +69,13 @@ func (c *controller) processItem() bool {
 	if err != nil {
 		fmt.Println("splitting key into namespace and name", err.Error())
 	}
-	//check wether obj is deleted from clusture
+	//check whether obj is deleted from cluster
 	_, err = c.clientset.AppsV1().Deployments(ns).Get(context.Background(), name, metav1.GetOptions{})
 	if errors.IsNotFound(err) {
-		fmt.Printf("handel delete eventv for dep%s\n ", name)
+		fmt.Printf("handle delete event for dep %s\n", name)
 		err := c.clientset.CoreV1().Services(ns).Delete(context.Background(), name, metav1.DeleteOptions{})
 		if err != nil {
-			fmt.Println("service id deleted", name, err.Error())
+			fmt.Println("service is deleted", name, err.Error())
 			return false
 		}
 		err = c.clientset.NetworkingV1().Ingresses(ns).Delete(context.Background(), name, metav1.DeleteOptions{})
@@ -89,45 +87,63 @@ func (c *controller) processItem() bool {
 	err = c.syncDeployment(ns, name)
 	if err != nil {
 		//retry
-
-		fmt.Printf("sync deploy%s\n", err.Error())
+		fmt.Printf("sync deploy %s\n", err.Error())
 		return false
 	}
 	return true
 }
 func (c *controller) syncDeployment(ns, name string) error {
-
 	dep, err := c.deplister.Deployments(ns).Get(name)
 	if err != nil {
 		if errors.IsNotFound(err) {
-			fmt.Printf("Deployment %s in work queue no longer exists\n")
+			fmt.Printf("Deployment %s in work queue no longer exists\n", name)
 			return nil
 		}
 		return err
 	}
-	svc := corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      dep.Name,
-			Namespace: ns,
-		},
-		Spec: corev1.ServiceSpec{
-			Selector: depLabels(*dep),
-			Ports: []corev1.ServicePort{
-				corev1.ServicePort{
-					Name: "http",
-					Port: 80,
-				},
-			},
-		},
-	}
-	s, err := c.clientset.CoreV1().Services(ns).Create(context.Background(), &svc, metav1.CreateOptions{})
+
+	// Check if the service already exists
+	svc, err := c.clientset.CoreV1().Services(ns).Get(context.Background(), name, metav1.GetOptions{})
 	if err != nil {
-		panic(err.Error())
+		if errors.IsNotFound(err) {
+			// Service doesn't exist, create it
+			svc = &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      dep.Name,
+					Namespace: ns,
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: depLabels(*dep),
+					Ports: []corev1.ServicePort{
+						{
+							Name: "http",
+							Port: 80,
+						},
+					},
+				},
+			}
+			svc, err = c.clientset.CoreV1().Services(ns).Create(context.Background(), svc, metav1.CreateOptions{})
+			if err != nil {
+				panic(err.Error())
+			}
+		} else {
+			// Some other error occurred
+			return err
+		}
+	} else {
+		// Service exists, update it
+		svc.Spec.Selector = depLabels(*dep)
+		svc, err = c.clientset.CoreV1().Services(ns).Update(context.Background(), svc, metav1.UpdateOptions{})
+		if err != nil {
+			return err
+		}
 	}
-	return createingress(context.Background(), c.clientset, *s)
+
+	return createingress(context.Background(), c.clientset, *svc)
 }
+
 func createingress(ctx context.Context, clientset kubernetes.Interface, svc corev1.Service) error {
-	pathType := "Prefix"
+	pathType := netv1.PathTypePrefix
 	ingress := netv1.Ingress{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      svc.Name,
@@ -138,13 +154,13 @@ func createingress(ctx context.Context, clientset kubernetes.Interface, svc core
 		},
 		Spec: netv1.IngressSpec{
 			Rules: []netv1.IngressRule{
-				netv1.IngressRule{
+				{
 					IngressRuleValue: netv1.IngressRuleValue{
 						HTTP: &netv1.HTTPIngressRuleValue{
 							Paths: []netv1.HTTPIngressPath{
-								netv1.HTTPIngressPath{
-									Path:     fmt.Sprintf("%s", svc.Name),
-									PathType: (*netv1.PathType)(&pathType),
+								{
+									Path:     fmt.Sprintf("/%s", svc.Name),
+									PathType: &pathType,
 									Backend: netv1.IngressBackend{
 										Service: &netv1.IngressServiceBackend{
 											Name: svc.Name,
@@ -168,10 +184,12 @@ func createingress(ctx context.Context, clientset kubernetes.Interface, svc core
 func depLabels(dep appsv1.Deployment) map[string]string {
 	return dep.Spec.Template.Labels
 }
+
 func (c *controller) handleAdd(obj interface{}) {
 	fmt.Println("add is called")
 	c.queue.Add(obj)
 }
+
 func (c *controller) handleDel(obj interface{}) {
 	fmt.Println("delete is called")
 	c.queue.Add(obj)
